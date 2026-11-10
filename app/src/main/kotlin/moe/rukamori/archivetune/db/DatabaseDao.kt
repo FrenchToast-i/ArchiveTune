@@ -868,8 +868,8 @@ interface DatabaseDao {
     @Query("DELETE FROM lyrics_sync_offset WHERE songId = :songId")
     suspend fun deleteLyricsSyncOffset(songId: String)
 
-    @Query("DELETE FROM lyrics")
-    fun clearAllLyrics()
+    @Query("DELETE FROM lyrics WHERE source = 'REMOTE'")
+    fun clearRemoteLyrics()
 
     @Transaction
     @SuppressWarnings(RoomWarnings.QUERY_MISMATCH)
@@ -2186,50 +2186,41 @@ interface DatabaseDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     fun insert(lyrics: LyricsEntity): Long
 
-    @Transaction
-    fun insertLyricsIfAbsent(
-        id: String,
-        lyrics: String,
-        provider: String?,
-        source: String = LyricsEntity.Source.REMOTE.value,
-        updatedAt: Long = System.currentTimeMillis(),
-    ) {
-        insert(
-            LyricsEntity(
-                id = id,
-                lyrics = lyrics,
-                source = source,
-                updatedAt = updatedAt,
-                provider = provider,
-            ),
-        )
-    }
-
-    @Query("SELECT provider FROM lyrics WHERE id = :id")
-    fun lyricsProvider(id: String): String?
+    @Query("SELECT * FROM lyrics WHERE id = :id LIMIT 1")
+    fun lyricsBlocking(id: String): LyricsEntity?
 
     @Query(
         """
         UPDATE lyrics
-        SET lyrics = :lyrics, source = :source, updatedAt = :updatedAt
-        WHERE id = :id AND lyrics = :notFoundLyrics
+        SET lyrics = :lyrics, source = :source, updatedAt = :updatedAt, provider = :provider,
+            providerUrl = :providerUrl, providerAuthor = :providerAuthor, providerAuthorUrl = :providerAuthorUrl
+        WHERE id = :id AND lyrics = :notFoundLyrics AND source = :remoteSource
         """,
     )
-    fun replaceLyricsIfNotFound(
+    fun replaceRemoteNotFoundLyrics(
         id: String,
         lyrics: String,
         source: String,
+        provider: String?,
+        providerUrl: String?,
+        providerAuthor: String?,
+        providerAuthorUrl: String?,
         updatedAt: Long,
         notFoundLyrics: String,
+        remoteSource: String,
     ): Int
 
     @Transaction
-    fun replaceLyricsIfAbsentOrNotFound(
+    fun saveFetchedLyrics(
         id: String,
         lyrics: String,
-        source: String = LyricsEntity.Source.REMOTE.value,
+        provider: String?,
+        providerUrl: String? = null,
+        providerAuthor: String? = null,
+        providerAuthorUrl: String? = null,
         updatedAt: Long = System.currentTimeMillis(),
     ) {
+        val source = LyricsEntity.Source.REMOTE.value
         val insertedRowId =
             insert(
                 LyricsEntity(
@@ -2237,15 +2228,24 @@ interface DatabaseDao {
                     lyrics = lyrics,
                     source = source,
                     updatedAt = updatedAt,
+                    provider = provider,
+                    providerUrl = providerUrl,
+                    providerAuthor = providerAuthor,
+                    providerAuthorUrl = providerAuthorUrl,
                 ),
             )
         if (insertedRowId == -1L) {
-            replaceLyricsIfNotFound(
+            replaceRemoteNotFoundLyrics(
                 id = id,
                 lyrics = lyrics,
                 source = source,
+                provider = provider,
+                providerUrl = providerUrl,
+                providerAuthor = providerAuthor,
+                providerAuthorUrl = providerAuthorUrl,
                 updatedAt = updatedAt,
                 notFoundLyrics = LyricsEntity.LYRICS_NOT_FOUND,
+                remoteSource = source,
             )
         }
     }
@@ -2256,6 +2256,9 @@ interface DatabaseDao {
         lyrics: String,
         source: String,
         provider: String?,
+        providerUrl: String? = null,
+        providerAuthor: String? = null,
+        providerAuthorUrl: String? = null,
         updatedAt: Long = System.currentTimeMillis(),
     ) {
         upsert(
@@ -2265,6 +2268,9 @@ interface DatabaseDao {
                 source = source,
                 updatedAt = updatedAt,
                 provider = provider,
+                providerUrl = providerUrl,
+                providerAuthor = providerAuthor,
+                providerAuthorUrl = providerAuthorUrl,
             ),
         )
     }
@@ -2276,11 +2282,15 @@ interface DatabaseDao {
         source: String,
         updatedAt: Long = System.currentTimeMillis(),
     ) {
+        val existing = lyricsBlocking(id)
         replaceLyrics(
             id = id,
             lyrics = lyrics,
             source = source,
-            provider = lyricsProvider(id),
+            provider = existing?.provider,
+            providerUrl = existing?.providerUrl,
+            providerAuthor = existing?.providerAuthor,
+            providerAuthorUrl = existing?.providerAuthorUrl,
             updatedAt = updatedAt,
         )
     }

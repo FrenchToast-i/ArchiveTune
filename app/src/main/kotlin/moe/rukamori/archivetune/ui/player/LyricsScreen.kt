@@ -101,6 +101,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -120,6 +121,9 @@ import coil3.request.allowHardware
 import coil3.size.Size
 import coil3.toBitmap
 import dagger.hilt.android.EntryPointAccessors
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.rememberHazeState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -144,12 +148,14 @@ import moe.rukamori.archivetune.constants.PlayerCustomContrastKey
 import moe.rukamori.archivetune.constants.PlayerCustomImageUriKey
 import moe.rukamori.archivetune.extensions.togglePlayPause
 import moe.rukamori.archivetune.db.entities.LyricsEntity
+import moe.rukamori.archivetune.db.entities.needsRemoteFetch
 import moe.rukamori.archivetune.models.MediaMetadata
 import moe.rukamori.archivetune.ui.component.LocalMenuState
 import moe.rukamori.archivetune.ui.component.LyricsEnhanced
 import moe.rukamori.archivetune.ui.component.LyricsSearchingIndicator
 import moe.rukamori.archivetune.ui.component.LyricsV2
 import moe.rukamori.archivetune.ui.component.PlayerSliderTrack
+import moe.rukamori.archivetune.ui.component.buildLyricsSourceLabel
 import moe.rukamori.archivetune.ui.component.rememberControlledSliderState
 import moe.rukamori.archivetune.ui.menu.LyricsMenu
 import moe.rukamori.archivetune.ui.theme.PlayerColorExtractor
@@ -225,11 +231,22 @@ fun LyricsScreen(
             ?.let { entity ->
                 when {
                     entity.source == LyricsEntity.Source.EMBEDDED.value -> {
-                        stringResource(R.string.lyrics_source_label, stringResource(R.string.lyrics_source_embedded))
+                        AnnotatedString(
+                            stringResource(R.string.lyrics_source_label, stringResource(R.string.lyrics_source_embedded)),
+                        )
                     }
 
                     entity.provider != null -> {
-                        stringResource(R.string.lyrics_source_label, entity.provider)
+                        val label = stringResource(R.string.lyrics_source_label, entity.provider)
+                        remember(label, entity.provider, entity.providerUrl, entity.providerAuthor, entity.providerAuthorUrl) {
+                            buildLyricsSourceLabel(
+                                text = label,
+                                providerName = entity.provider,
+                                providerUrl = entity.providerUrl,
+                                author = entity.providerAuthor,
+                                authorUrl = entity.providerAuthorUrl,
+                            )
+                        }
                     }
 
                     else -> {
@@ -292,24 +309,28 @@ fun LyricsScreen(
 
     LaunchedEffect(mediaMetadata.id, currentLyrics?.lyrics) {
         if (mediaMetadata.isPodcast) return@LaunchedEffect
-        if (currentLyrics != null) return@LaunchedEffect
+        if (!currentLyrics.needsRemoteFetch()) return@LaunchedEffect
         try {
             val existingLyrics =
                 withContext(Dispatchers.IO) {
                     database.lyrics(mediaMetadata.id).first()
                 }
-            if (existingLyrics != null) return@LaunchedEffect
+            if (!existingLyrics.needsRemoteFetch()) return@LaunchedEffect
 
             val fetched =
                 withContext(Dispatchers.IO) {
                     lyricsHelper.getLyrics(mediaMetadata)
                 }
+            if (!fetched.isConclusive) return@LaunchedEffect
             withContext(Dispatchers.IO) {
                 database.query {
-                    insertLyricsIfAbsent(
+                    saveFetchedLyrics(
                         id = mediaMetadata.id,
                         lyrics = fetched.lyrics,
                         provider = fetched.providerName,
+                        providerUrl = fetched.providerUrl,
+                        providerAuthor = fetched.author,
+                        providerAuthorUrl = fetched.authorUrl,
                     )
                 }
             }
@@ -441,6 +462,8 @@ fun LyricsScreen(
 
     BackHandler(enabled = backHandlerEnabled, onBack = onBackClick)
 
+    val lyricsBackdropHazeState = rememberHazeState()
+
     Box(
         modifier =
             modifier
@@ -463,6 +486,7 @@ fun LyricsScreen(
             playerCustomBlur = playerCustomBlur,
             playerCustomContrast = playerCustomContrast,
             playerCustomBrightness = playerCustomBrightness,
+            modifier = Modifier.hazeSource(lyricsBackdropHazeState),
         )
 
         Box(
@@ -508,6 +532,7 @@ fun LyricsScreen(
                         sliderPositionProvider = { sliderPosition },
                         sourceLabel = lyricsSourceLabel,
                         lyricsSyncOffset = lyricsSyncOffset,
+                        backdropHazeState = lyricsBackdropHazeState,
                         modifier =
                             Modifier
                                 .weight(1f)
@@ -590,6 +615,7 @@ fun LyricsScreen(
                     sliderPositionProvider = { sliderPosition },
                     sourceLabel = lyricsSourceLabel,
                     lyricsSyncOffset = lyricsSyncOffset,
+                    backdropHazeState = lyricsBackdropHazeState,
                     modifier =
                         Modifier
                             .weight(1f)
@@ -970,8 +996,9 @@ private fun AppleMusicLyricsPane(
     lyricsState: LyricsRenderScreenState,
     foregroundColor: Color,
     sliderPositionProvider: () -> Long?,
-    sourceLabel: String?,
+    sourceLabel: AnnotatedString?,
     lyricsSyncOffset: Int,
+    backdropHazeState: HazeState,
     modifier: Modifier = Modifier,
 ) {
     LyricsContent(
@@ -980,6 +1007,7 @@ private fun AppleMusicLyricsPane(
         sliderPositionProvider = sliderPositionProvider,
         sourceLabel = sourceLabel,
         lyricsSyncOffset = lyricsSyncOffset,
+        backdropHazeState = backdropHazeState,
         modifier =
             modifier
                 .fillMaxSize()
@@ -1385,9 +1413,10 @@ private fun LyricsContent(
     lyricsMode: LyricsMode,
     lyricsState: LyricsRenderScreenState,
     sliderPositionProvider: () -> Long?,
-    sourceLabel: String?,
+    sourceLabel: AnnotatedString?,
     lyricsSyncOffset: Int,
     textColor: Color,
+    backdropHazeState: HazeState,
     modifier: Modifier = Modifier,
 ) {
     when (lyricsMode) {
@@ -1418,6 +1447,7 @@ private fun LyricsContent(
                     modifier = modifier,
                     sourceLabel = sourceLabel,
                     textColorOverride = textColor,
+                    backdropHazeState = backdropHazeState,
                 )
             }
         }
@@ -1430,6 +1460,7 @@ private fun LyricsContent(
                 modifier = modifier,
                 sourceLabel = sourceLabel,
                 textColorOverride = textColor,
+                backdropHazeState = backdropHazeState,
             )
         }
     }

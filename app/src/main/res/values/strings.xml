@@ -325,6 +325,14 @@
     <string name="edit_song">Edit song</string>
     <string name="song_title">Song title</string>
     <string name="song_artists">Song artists</string>
+    <string name="lyrics_search_filter_empty">No lyrics in this format</string>
+    <string name="lyrics_search_show_all_formats">Show all formats</string>
+    <string name="lyrics_search_title_required">Enter a song title to search</string>
+    <string name="lyrics_search_online_failed">Couldn\'t open a web search app.</string>
+    <plurals name="lyrics_search_format_filter_description">
+        <item quantity="one">%1$s, %2$d result</item>
+        <item quantity="other">%1$s, %2$d results</item>
+    </plurals>
     <string name="unsupported_language">Unsupported language: %1$s</string>
     <string name="source">Source</string>
     <string name="save">Save</string>
@@ -373,6 +381,8 @@
     <string name="undo">Undo</string>
     <string name="lyrics_not_found">Lyrics not found</string>
     <string name="lyrics_word_sync">Word Sync</string>
+    <string name="lyrics_now_singing">%1$s</string>
+    <string name="lyrics_resume_auto_scroll">Resume</string>
     <string name="sleep_timer">Sleep timer</string>
     <string name="end_of_song">End of song</string>
     <plurals name="minute">
@@ -678,6 +688,23 @@
     <string name="audio_normalization">Audio normalization</string>
     <string name="audio_offload">Audio offload</string>
     <string name="audio_offload_desc">Let supported devices play audio using low-power hardware decoding. Some audio processing features are disabled.</string>
+    <string name="usb_bit_perfect">USB DAC bit-perfect output</string>
+    <string name="usb_bit_perfect_desc">Send audio to a USB DAC unchanged, at each track\'s own sample rate and bit depth. Equalizer, normalization, crossfade, and playback speed don\'t apply.</string>
+    <string name="usb_bit_perfect_driver">Output driver</string>
+    <string name="usb_bit_perfect_driver_desc">Android\'s mixer needs Android 14 and leaves volume to the DAC, so set it there first. The direct driver works on any Android version, sets the DAC\'s own volume, and keeps the DAC from other apps while it plays.</string>
+    <string name="usb_bit_perfect_driver_android">Android bit-perfect mixer</string>
+    <string name="usb_bit_perfect_driver_direct">Direct USB driver</string>
+    <string name="usb_dac_volume">DAC volume</string>
+    <string name="usb_bit_perfect_fixed_volume">Allow DACs without volume control</string>
+    <string name="usb_bit_perfect_fixed_volume_desc">Play at full level when the DAC has no hardware volume. Turn the volume down on the DAC or amplifier first.</string>
+    <string name="usb_bit_perfect_status">Output status</string>
+    <string name="usb_bit_perfect_status_no_dac">No USB DAC connected. Playback uses standard output.</string>
+    <string name="usb_bit_perfect_status_ready">%1$s is connected. Bit-perfect output starts with the next compatible track.</string>
+    <string name="usb_bit_perfect_status_active">Bit-perfect to %1$s · %2$s kHz / %3$d-bit</string>
+    <string name="usb_bit_perfect_status_inexact">Direct to %1$s · %2$s kHz / %3$d-bit. This source isn\'t integer PCM, so samples are rounded.</string>
+    <string name="usb_bit_perfect_status_permission">Tap to allow USB access to %1$s.</string>
+    <string name="usb_bit_perfect_status_no_volume">%1$s has no hardware volume control. Allow DACs without volume control to use it. Playback uses standard output.</string>
+    <string name="usb_bit_perfect_status_fallback">%1$s can\'t play this track bit-perfect. Playback uses standard output.</string>
     <string name="pause_on_device_mute">Pause when device volume is 0</string>
     <string name="pause_on_device_mute_desc">Pause at zero volume, explain play attempts, and resume when volume increases</string>
     <string name="device_mute_recovery_volume">Increase volume from 0</string>
@@ -772,7 +799,7 @@
     <string name="max_song_cache_size">Max song cache size</string>
     <string name="clear_song_cache">Clear song cache</string>
     <string name="clear_lyrics_cache">Clear lyrics cache</string>
-    <string name="clear_lyrics_cache_confirm">Are you sure you want to clear all lyrics cache?</string>
+    <string name="clear_lyrics_cache_confirm">Downloaded lyrics will be removed and fetched again when needed. Lyrics you edited, picked from search or that are embedded in files are kept.</string>
     <string name="paxsenix_stats">Paxsenix API Stats</string>
     <string name="uptime">Uptime</string>
     <string name="total_requests">Total Requests</string>
