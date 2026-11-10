@@ -37,6 +37,8 @@ jobs:
       - name: Fetch and merge upstream
         id: merge
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           git config user.name 'github-actions[bot]'
@@ -47,6 +49,7 @@ jobs:
           git fetch --no-tags origin "$BRANCH"
           git checkout -B "$BRANCH" "origin/$BRANCH"
 
+          pre_merge="$(git rev-parse HEAD)"
           new_commits="$(git rev-list --count "HEAD..upstream/$BRANCH")"
           echo "Upstream commits not in fork: $new_commits"
 
@@ -60,22 +63,49 @@ jobs:
             exit 0
           fi
 
-          if git merge --no-edit \
+          if ! git merge --no-edit \
               -m "chore(nightly): merge upstream ${UPSTREAM_REPO}@${BRANCH} [skip ci]" \
               "upstream/$BRANCH"; then
-            git push origin "HEAD:${BRANCH}"
-            {
-              echo "conflict=false"
-              echo "changed=true"
-              echo "sha=$(git rev-parse HEAD)"
-            } >> "$GITHUB_OUTPUT"
-          else
             conflicted="$(git diff --name-only --diff-filter=U | tr '\n' ' ' || true)"
             git merge --abort
             echo "::error::Automatic merge from upstream $BRANCH failed. Conflicting paths: ${conflicted:-unknown}"
             {
               echo "conflict=true"
               echo "changed=false"
+              echo "sha=$pre_merge"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+          # GITHUB_TOKEN may not create or update workflow files. Keep the fork's copies
+          # pinned to their pre-merge content so the push is allowed; CI config stays
+          # owned by this fork rather than by upstream.
+          added="$(git diff --name-only --diff-filter=A "$pre_merge" HEAD -- .github/workflows || true)"
+          old_files="$(git ls-tree -r --name-only "$pre_merge" -- .github/workflows || true)"
+          if [ -n "$added" ]; then
+            printf '%s\n' "$added" | xargs -r git rm -q --
+          fi
+          if [ -n "$old_files" ]; then
+            printf '%s\n' "$old_files" | xargs -r git checkout "$pre_merge" --
+          fi
+          if ! git diff --cached --quiet; then
+            git add -A .github/workflows
+            git commit -q -m "ci(nightly): pin fork workflow files [skip ci]"
+          fi
+
+          if git push origin "HEAD:${BRANCH}"; then
+            {
+              echo "conflict=false"
+              echo "changed=true"
+              echo "sha=$(git rev-parse HEAD)"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Upstream $BRANCH was merged locally but could not be pushed to the fork; the build below still uses the merged commit."
+            {
+              echo "conflict=true"
+              echo "changed=true"
               echo "sha=$(git rev-parse HEAD)"
             } >> "$GITHUB_OUTPUT"
           fi
