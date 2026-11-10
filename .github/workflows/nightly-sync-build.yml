@@ -208,24 +208,59 @@ jobs:
           base_version="$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -n 1)"
           nightly_version="${base_version:-0.0.0}-nightly.$(date -u +%Y%m%d)"
           echo "Building ${nightly_version} from ${{ needs.sync.outputs.sha }}"
+          # The 'nightly' build type appends '.nightly' to the application id, giving
+          # moe.rukamori.archivetune.nightly so it installs alongside the official app.
           ./gradlew --console=plain \
-            assemble${{ matrix.distributionName }}${{ matrix.deviceName }}${{ matrix.abiName }}Release \
+            assemble${{ matrix.distributionName }}${{ matrix.deviceName }}${{ matrix.abiName }}Nightly \
             -PnightlyVersionName="$nightly_version"
 
-      - name: Collect APK
+      - name: Sign APK and verify package id
         id: collect
         shell: bash
+        env:
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          EXPECTED_PACKAGE: moe.rukamori.archivetune.nightly
         run: |
           set -euo pipefail
-          mapfile -t SIGNED < <(find app/build/outputs/apk -type f -name '*.apk' ! -name '*-unsigned.apk' | sort)
-          if [ "${#SIGNED[@]}" -eq 0 ]; then
-            echo "::error::No signed APK produced. The release signing config was not applied."
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BUILD_TOOLS="$(find "$SDK/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)"
+          if [ ! -x "$BUILD_TOOLS/apksigner" ]; then
+            echo "::error::apksigner not found under $SDK/build-tools"
+            exit 1
+          fi
+
+          mapfile -t UNSIGNED < <(find app/build/outputs/apk -type f -name '*-unsigned.apk' | sort)
+          if [ "${#UNSIGNED[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one unsigned APK, found ${#UNSIGNED[@]}"
             find app/build/outputs/apk -type f -name '*.apk' -print || true
             exit 1
           fi
+
           name="ArchiveTune-${{ matrix.distribution }}-${{ matrix.device }}-${{ matrix.abi }}-nightly.apk"
+          aligned="$RUNNER_TEMP/aligned.apk"
           mkdir -p out
-          cp "${SIGNED[0]}" "out/${name}"
+          "$BUILD_TOOLS/zipalign" -f -P 16 4 "${UNSIGNED[0]}" "$aligned"
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks app/keystore/release.keystore \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KEYSTORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --out "out/${name}" \
+            "$aligned"
+          rm -f "$aligned" "out/${name}.idsig"
+
+          "$BUILD_TOOLS/apksigner" verify "out/${name}" | head -n 3
+          "$BUILD_TOOLS/apksigner" verify --print-certs "out/${name}" | head -n 3
+
+          package_id="$("$BUILD_TOOLS/aapt2" dump badging "out/${name}" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
+          echo "package id: ${package_id:-<none>}"
+          if [ "$package_id" != "$EXPECTED_PACKAGE" ]; then
+            echo "::error::Expected package id $EXPECTED_PACKAGE but built ${package_id:-<none>}"
+            exit 1
+          fi
+
           echo "apk=out/${name}" >> "$GITHUB_OUTPUT"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
           ls -lh "out/${name}"
@@ -262,12 +297,14 @@ jobs:
           - Commit: \`${short}\`
           - Built: $(date -u '+%Y-%m-%d %H:%M UTC')
           - Upstream: \`${UPSTREAM_REPO}@${BRANCH}\`
+          - Package: \`moe.rukamori.archivetune.nightly\`
 
-          APKs are signed with the fork's own build key, so they install over previous nightly
-          builds but not over the official ArchiveTune release (uninstall that first)."
+          The APKs use their own package id, so they install alongside the official ArchiveTune
+          instead of replacing it, and they upgrade over previous nightly builds signed with the
+          same key."
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --notes "$notes"
+            gh release edit "$RELEASE_TAG" --title "Nightly dev build" --notes "$notes"
             gh release upload "$RELEASE_TAG" artifacts/*.apk --clobber
           else
             gh release create "$RELEASE_TAG" artifacts/*.apk \
