@@ -1,0 +1,259 @@
+name: Nightly dev sync and build
+
+# Runs on the fork's default branch so the schedule is active.
+# 08:00 UTC == 03:00 America/Chicago during CDT, 02:00 during CST (cron has no timezone).
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-dev-sync-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: rukamori/ArchiveTune
+  BRANCH: dev
+  RELEASE_TAG: nightly
+
+jobs:
+  sync:
+    name: Merge upstream dev into fork dev
+    runs-on: ubuntu-latest
+    outputs:
+      conflict: ${{ steps.merge.outputs.conflict }}
+      sha: ${{ steps.merge.outputs.sha }}
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - name: Checkout fork dev branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch and merge upstream
+        id: merge
+        shell: bash
+        run: |
+          set -uo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$BRANCH"
+          git fetch --no-tags origin "$BRANCH"
+          git checkout -B "$BRANCH" "origin/$BRANCH"
+
+          new_commits="$(git rev-list --count "HEAD..upstream/$BRANCH")"
+          echo "Upstream commits not in fork: $new_commits"
+
+          if [ "$new_commits" -eq 0 ]; then
+            echo "Fork is already up to date with upstream $BRANCH."
+            {
+              echo "conflict=false"
+              echo "changed=false"
+              echo "sha=$(git rev-parse HEAD)"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge --no-edit \
+              -m "chore(nightly): merge upstream ${UPSTREAM_REPO}@${BRANCH} [skip ci]" \
+              "upstream/$BRANCH"; then
+            git push origin "HEAD:${BRANCH}"
+            {
+              echo "conflict=false"
+              echo "changed=true"
+              echo "sha=$(git rev-parse HEAD)"
+            } >> "$GITHUB_OUTPUT"
+          else
+            conflicted="$(git diff --name-only --diff-filter=U | tr '\n' ' ' || true)"
+            git merge --abort
+            echo "::error::Automatic merge from upstream $BRANCH failed. Conflicting paths: ${conflicted:-unknown}"
+            {
+              echo "conflict=true"
+              echo "changed=false"
+              echo "sha=$(git rev-parse HEAD)"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write run summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Upstream sync"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| upstream | \`${UPSTREAM_REPO}@${BRANCH}\` |"
+            echo "| merged | \`${{ steps.merge.outputs.changed }}\` |"
+            echo "| conflict | \`${{ steps.merge.outputs.conflict }}\` |"
+            echo "| dev HEAD | \`${{ steps.merge.outputs.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.distribution }} ${{ matrix.device }} ${{ matrix.abi }}
+    needs: sync
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distribution: gms
+            distributionName: Gms
+            device: mobile
+            deviceName: Mobile
+            abi: universal
+            abiName: Universal
+          - distribution: foss
+            distributionName: Foss
+            device: mobile
+            deviceName: Mobile
+            abi: universal
+            abiName: Universal
+
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Generate translation contributor credits
+        run: python scripts/generate_translation_contributors.py
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          java-version: '27'
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: false
+
+      - name: Restore signing keystore
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "::error::KEYSTORE secret is missing; the APK would be unsigned."
+            exit 1
+          fi
+          mkdir -p app/keystore
+          printf '%s' "$KEYSTORE_B64" | base64 -d > app/keystore/release.keystore
+
+      - name: Build APK
+        shell: bash
+        env:
+          PULL_REQUEST: 'false'
+          GITHUB_EVENT_NAME: schedule
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ArchiveTune
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          API_BEARER_TOKEN: ${{ secrets.API_BEARER_TOKEN }}
+          TOGETHER_BEARER_TOKEN: ${{ secrets.TOGETHER_BEARER_TOKEN }}
+          CANVAS_BEARER_TOKEN: ${{ secrets.CANVAS_BEARER_TOKEN }}
+          EXTRACTOR_BEARER: ${{ secrets.EXTRACTOR_BEARER }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          base_version="$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -n 1)"
+          nightly_version="${base_version:-0.0.0}-nightly.$(date -u +%Y%m%d)"
+          echo "Building ${nightly_version} from ${{ needs.sync.outputs.sha }}"
+          ./gradlew --console=plain \
+            assemble${{ matrix.distributionName }}${{ matrix.deviceName }}${{ matrix.abiName }}Release \
+            -PnightlyVersionName="$nightly_version"
+
+      - name: Collect APK
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t SIGNED < <(find app/build/outputs/apk -type f -name '*.apk' ! -name '*-unsigned.apk' | sort)
+          if [ "${#SIGNED[@]}" -eq 0 ]; then
+            echo "::error::No signed APK produced. The release signing config was not applied."
+            find app/build/outputs/apk -type f -name '*.apk' -print || true
+            exit 1
+          fi
+          name="ArchiveTune-${{ matrix.distribution }}-${{ matrix.device }}-${{ matrix.abi }}-nightly.apk"
+          mkdir -p out
+          cp "${SIGNED[0]}" "out/${name}"
+          echo "apk=out/${name}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          ls -lh "out/${name}"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.collect.outputs.name }}
+          path: ${{ steps.collect.outputs.apk }}
+          retention-days: 14
+
+  release:
+    name: Publish rolling nightly release
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create or update nightly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha='${{ needs.sync.outputs.sha }}'
+          short="${sha:0:7}"
+          notes="Automated nightly build of the \`dev\` branch.
+
+          - Commit: \`${short}\`
+          - Built: $(date -u '+%Y-%m-%d %H:%M UTC')
+          - Upstream: \`${UPSTREAM_REPO}@${BRANCH}\`
+
+          APKs are signed with the fork's own build key, so they install over previous nightly
+          builds but not over the official ArchiveTune release (uninstall that first)."
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --notes "$notes"
+            gh release upload "$RELEASE_TAG" artifacts/*.apk --clobber
+          else
+            gh release create "$RELEASE_TAG" artifacts/*.apk \
+              --prerelease \
+              --target "$sha" \
+              --title "Nightly dev build" \
+              --notes "$notes"
+          fi
+          ls -lh artifacts
+
+  report-merge-conflict:
+    name: Fail if the upstream merge conflicted
+    needs: [sync, build, release]
+    if: needs.sync.outputs.conflict == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail the run
+        run: |
+          echo "::error::Upstream $UPSTREAM_REPO@$BRANCH could not be merged automatically. Fix the conflicts in the fork's $BRANCH branch; the build above used the last good commit."
+          exit 1
