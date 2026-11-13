@@ -37,6 +37,7 @@ import moe.rukamori.archivetune.utils.YTPlayerUtils
 import moe.rukamori.archivetune.utils.dataStore
 import moe.rukamori.archivetune.utils.potoken.BotGuardTokenGenerator
 import moe.rukamori.archivetune.utils.toPlaybackAuthState
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import timber.log.Timber
 import java.io.InterruptedIOException
 import java.net.ConnectException
@@ -325,22 +326,23 @@ class ResolveAudioStreamUseCase
             cache.entries.removeIf { it.value.url == url }
         }
 
-        fun reportRejectedStream(url: String): Boolean {
-            if (YTPlayerUtils.isExpiredOrNearExpiredStreamUrl(url)) return false
+        fun reportRejectedStream(url: String) {
+            val rejectedUrl = url.canonicalStreamUrl()
             val rejectedEntry =
-                cache.entries.firstOrNull { it.value.url == url && it.value.source == StreamSource.YOUTUBEI }
-                    ?: return false
-            if (rejectedEntry.key.network != playbackNetworkConfiguration(context)) return false
+                cache.entries.firstOrNull { it.value.url.canonicalStreamUrl() == rejectedUrl } ?: return
             val rejected = rejectedEntry.value
-            val rejectedBinding = rejected.gvsPoTokenBinding ?: return false
-            youtubeiRepository.reportRejectedGvsPoToken(rejected.authFingerprint, rejectedBinding)
             synchronized(inFlightLock) {
-                cache.entries.removeIf {
-                    it.value.authFingerprint == rejected.authFingerprint &&
-                        it.value.gvsPoTokenBinding == rejectedBinding
-                }
+                cache.entries.removeIf { it.value.url.canonicalStreamUrl() == rejectedUrl }
             }
-            return true
+            if (rejected.source != StreamSource.YOUTUBEI) return
+            if (YTPlayerUtils.isExpiredOrNearExpiredStreamUrl(url)) return
+            if (rejectedEntry.key.network != playbackNetworkConfiguration(context)) return
+            val rejectedBinding = rejected.gvsPoTokenBinding ?: return
+            val rejectedGeneration = rejected.gvsPoTokenMinterGeneration ?: return
+            youtubeiRepository.reportRejectedGvsPoToken(rejectedGeneration, rejectedBinding)
+            synchronized(inFlightLock) {
+                cache.entries.removeIf { it.value.gvsPoTokenMinterGeneration == rejectedGeneration }
+            }
         }
 
         fun invalidateSession() {
@@ -542,6 +544,8 @@ class ResolveAudioStreamUseCase
 
         private fun isFresh(stream: ResolvedAudioStream): Boolean =
             stream.expiresAtMs > System.currentTimeMillis() + STREAM_EXPIRY_SAFETY_MS
+
+        private fun String.canonicalStreamUrl(): String = toHttpUrlOrNull()?.toString() ?: this
 
         private companion object {
             const val TAG = "AudioStreamResolver"
