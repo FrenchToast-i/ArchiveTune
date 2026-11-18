@@ -432,8 +432,7 @@ fun BottomSheetPlayer(
     val currentSongLiked = currentSong?.song?.liked == true
     val queueTitle by playerConnection.queueTitle.collectAsState()
     val currentFormat by playerConnection.currentFormat.collectAsState(initial = null)
-    val queueWindows by playerConnection.queueWindows.collectAsState()
-    val currentWindowIndex by playerConnection.currentWindowIndex.collectAsState()
+    val queue by playerConnection.queue.collectAsState()
     val deviceMusicVolumeController = rememberDeviceMusicVolumeController()
     val onPlayerVolumeChange =
         remember(deviceMusicVolumeController) {
@@ -841,26 +840,21 @@ fun BottomSheetPlayer(
         }
     }
 
-    var showSleepTimerDialog by remember {
+    var showSleepTimerSheet by remember {
         mutableStateOf(false)
     }
 
     var sleepTimerValue by remember {
         mutableFloatStateOf(30f)
     }
-    if (showSleepTimerDialog) {
-        SleepTimerDialog(
-            onDismiss = { showSleepTimerDialog = false },
-            onConfirm = { mins ->
-                showSleepTimerDialog = false
-                sleepTimerValue = mins.toFloat()
-                playerConnection.service.sleepTimer.start(mins)
+    if (showSleepTimerSheet) {
+        SleepTimerBottomSheet(
+            value = sleepTimerValue,
+            onValueChange = { sleepTimerValue = it },
+            onDismiss = { showSleepTimerSheet = false },
+            onStart = { minutes, finishCurrentSong, fadeOut ->
+                playerConnection.service.sleepTimer.start(minutes, finishCurrentSong, fadeOut)
             },
-            onEndOfSong = {
-                showSleepTimerDialog = false
-                playerConnection.service.sleepTimer.start(-1)
-            },
-            initialValue = sleepTimerValue
         )
     }
 
@@ -887,7 +881,7 @@ fun BottomSheetPlayer(
                                 if (sleepTimerEnabled) {
                                     playerConnection.service.sleepTimer.clear()
                                 } else {
-                                    showSleepTimerDialog = true
+                                    showSleepTimerSheet = true
                                 }
                             },
                             onShowDetailsDialog = {
@@ -1175,8 +1169,8 @@ fun BottomSheetPlayer(
         val updatedOnSliderValueChangeFinished by rememberUpdatedState(onSliderValueChangeFinished)
 
         val nextUpMetadata =
-            remember(queueWindows, currentWindowIndex) {
-                queueWindows.getOrNull(currentWindowIndex + 1)?.mediaItem?.metadata
+            remember(queue) {
+                queue.windows.getOrNull(queue.currentIndex + 1)?.mediaItem?.metadata
             }
 
         val enrichedMetadata =
@@ -1217,7 +1211,7 @@ fun BottomSheetPlayer(
             if (sleepTimerEnabled) {
                 playerConnection.service.sleepTimer.clear()
             } else {
-                showSleepTimerDialog = true
+                showSleepTimerSheet = true
             }
         }
         val showPlayerMenu: (MediaMetadata) -> Unit = { metadata ->
@@ -1430,7 +1424,7 @@ fun BottomSheetPlayer(
                                                     if (sleepTimerEnabled) {
                                                         playerConnection.service.sleepTimer.clear()
                                                     } else {
-                                                        showSleepTimerDialog = true
+                                                        showSleepTimerSheet = true
                                                     }
                                                 },
                                                 onShowDetailsDialog = {
@@ -1582,7 +1576,7 @@ fun BottomSheetPlayer(
                                 if (sleepTimerEnabled) {
                                     playerConnection.service.sleepTimer.clear()
                                 } else {
-                                    showSleepTimerDialog = true
+                                    showSleepTimerSheet = true
                                 }
                             },
                             sleepTimerEnabled = sleepTimerEnabled,
@@ -1598,7 +1592,7 @@ fun BottomSheetPlayer(
                                             if (sleepTimerEnabled) {
                                                 playerConnection.service.sleepTimer.clear()
                                             } else {
-                                                showSleepTimerDialog = true
+                                                showSleepTimerSheet = true
                                             }
                                         },
                                         onShowDetailsDialog = {
@@ -1725,7 +1719,7 @@ fun BottomSheetPlayer(
                                                         if (sleepTimerEnabled) {
                                                             playerConnection.service.sleepTimer.clear()
                                                         } else {
-                                                            showSleepTimerDialog = true
+                                                            showSleepTimerSheet = true
                                                         }
                                                     },
                                                     onShowDetailsDialog = {
@@ -1876,7 +1870,7 @@ fun BottomSheetPlayer(
                                 if (sleepTimerEnabled) {
                                     playerConnection.service.sleepTimer.clear()
                                 } else {
-                                    showSleepTimerDialog = true
+                                    showSleepTimerSheet = true
                                 }
                             },
                             sleepTimerEnabled = sleepTimerEnabled,
@@ -1892,7 +1886,7 @@ fun BottomSheetPlayer(
                                             if (sleepTimerEnabled) {
                                                 playerConnection.service.sleepTimer.clear()
                                             } else {
-                                                showSleepTimerDialog = true
+                                                showSleepTimerSheet = true
                                             }
                                         },
                                         onShowDetailsDialog = {

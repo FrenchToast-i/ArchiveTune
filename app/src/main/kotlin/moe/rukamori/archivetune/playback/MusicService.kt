@@ -590,6 +590,7 @@ class MusicService :
     private var audioNormalizationEnabled = true
     var playerVolume = MutableStateFlow(1f)
     private val audioFocusVolumeFactor = MutableStateFlow(1f)
+    private val sleepTimerVolumeFactor = MutableStateFlow(1f)
     val recapAudioMuted = MutableStateFlow(false)
     val recapQueueActive = MutableStateFlow(false)
     private var recapAudioQueue: Queue? = null
@@ -598,7 +599,7 @@ class MusicService :
     private var crossfadeDurationMs = 0L
     private var crossfadeGapless = false
     private var crossfadeSuppressedMediaId: String? = null
-    private var crossfadeCoordinator: CrossfadeCoordinator? = null
+    private var crossfadeHandler: CrossfadeHandler? = null
 
     private data class CrossfadeConfig(
         val enabled: Boolean,
@@ -775,8 +776,9 @@ class MusicService :
     @DownloadCache
     lateinit var downloadCache: Cache
 
-    lateinit var localPlayer: ExoPlayer
-        private set
+    private lateinit var localPlaybackPlayer: SwappableLocalPlayer
+    val localPlayer: ExoPlayer
+        get() = localPlaybackPlayer.exoPlayer
     lateinit var player: Player
         private set
     private var pendingQueueRemoval: QueueRemoval? = null
@@ -1206,33 +1208,20 @@ class MusicService :
             driver = dataStore[UsbBitPerfectDriverKey].toEnum(UsbBitPerfectDriver.ANDROID),
             allowFixedVolume = dataStore.get(UsbBitPerfectFixedVolumeKey, false),
         )
-        localPlayer =
-            ExoPlayer
-                .Builder(this)
-                .setMediaSourceFactory(createMediaSourceFactory())
-                .setRenderersFactory(createRenderersFactory())
-                .setLoadControl(createPrimaryLoadControl())
-                .setTrackSelector(DefaultTrackSelector(this, SafeTrackSelectionFactory()))
-                .setHandleAudioBecomingNoisy(true)
-                .setWakeMode(C.WAKE_MODE_NETWORK)
-                .setAudioAttributes(
-                    playbackAudioAttributes(),
-                    false,
-                ).setSeekBackIncrementMs(5000)
-                .setSeekForwardIncrementMs(5000)
-                .setDeviceVolumeControlEnabled(true)
-                .build()
-                .apply {
+        localPlaybackPlayer =
+            SwappableLocalPlayer(
+                buildLocalExoPlayer().apply {
                     addAnalyticsListener(PlaybackStatsListener(false, this@MusicService))
-                    addListener(audioEffectPlayerListener)
-                    setOffloadEnabled(false)
-                }
+                },
+            ).apply {
+                addListener(audioEffectPlayerListener)
+            }
         castPlaybackRepository = CastPlaybackRepositoryLocator.get(this)
         player =
             castPlaybackRepository
                 .createPlayer(
                     context = this,
-                    localPlayer = localPlayer,
+                    localPlayer = localPlaybackPlayer,
                     mediaItemResolver =
                         object : CastMediaItemResolver {
                             override fun resolveForCast(mediaItem: MediaItem): MediaItem =
@@ -1254,15 +1243,18 @@ class MusicService :
                     sleepTimer = SleepTimer(scope, this, this@MusicService)
                     addListener(sleepTimer)
                 }
-        crossfadeCoordinator =
-            CrossfadeCoordinator(
+        crossfadeHandler =
+            CrossfadeHandler(
                 scope = { scope },
-                sessionPlayer = player,
-                createTailPlayer = ::createCrossfadeTailPlayer,
-                baseVolume = ::currentEffectivePlayerVolumeForMediaId,
-                maxVolume = maxSafeGainFactor,
-                isAllowed = { crossfadeEnabled && !sleepTimer.pauseWhenSongEnd },
-                onFinished = ::onCrossfadeFinished,
+                host = localPlaybackPlayer,
+                isLocalPlayback = ::isLocalPlaybackActive,
+                canStart = { crossfadeEnabled && !sleepTimer.pauseWhenSongEnd && !bitPerfectOutput.status.value.active },
+                createPlayer = ::createCrossfadePlayer,
+                activatePlayer = ::activateCrossfadePlayer,
+                releasePlayer = ::releaseCrossfadePlayer,
+                volumeFor = { mediaId -> currentEffectivePlayerVolumeForMediaId(mediaId).coerceIn(0f, maxSafeGainFactor) },
+                onFadeFinished = ::onCrossfadeFinished,
+                onAbandoned = ::onCrossfadeAbandoned,
             )
         sponsorBlockPlaybackController.attach(player, scope)
         playerInitialized.value = true
@@ -1396,7 +1388,13 @@ class MusicService :
             }
         }
 
-        combine(playerVolume, normalizeFactor, audioFocusVolumeFactor, recapAudioMuted) { playerVolume, normalizeFactor, audioFocusVolumeFactor, _ ->
+        combine(
+            playerVolume,
+            normalizeFactor,
+            audioFocusVolumeFactor,
+            recapAudioMuted,
+            sleepTimerVolumeFactor,
+        ) { playerVolume, normalizeFactor, audioFocusVolumeFactor, _, _ ->
             calculateEffectivePlayerVolume(playerVolume, normalizeFactor, audioFocusVolumeFactor)
         }.collectLatest(scope) { finalVolume ->
             updateEffectiveVolume(finalVolume)
@@ -1455,7 +1453,6 @@ class MusicService :
             .distinctUntilChanged()
             .collectLatest(scope) {
                 localPlayer.skipSilenceEnabled = it
-                crossfadeCoordinator?.setTailSkipSilenceEnabled(it)
             }
 
         dataStore.data
@@ -2516,12 +2513,12 @@ class MusicService :
     }
 
     private fun updateAudioBecomingNoisyHandling() {
-        if (!::localPlayer.isInitialized) return
+        if (!::localPlaybackPlayer.isInitialized) return
         localPlayer.setHandleAudioBecomingNoisy(!bitPerfectOutput.ownsUsbDisconnectHandling)
     }
 
     private fun reselectAudioSinkOutput() {
-        if (!::localPlayer.isInitialized || localPlayer.currentMediaItem == null) return
+        if (!::localPlaybackPlayer.isInitialized || localPlayer.currentMediaItem == null) return
         val state = localPlayer.playbackState
         if (state == Player.STATE_IDLE || state == Player.STATE_ENDED) return
         localPlayer.seekTo(localPlayer.currentPosition.coerceAtLeast(0L))
@@ -2568,8 +2565,17 @@ class MusicService :
             normalizeFactor.takeIf { it.isFinite() }?.coerceIn(MIN_AUDIO_NORMALIZATION_FACTOR, MAX_AUDIO_NORMALIZATION_FACTOR) ?: 1f
         val safeAudioFocusVolumeFactor =
             audioFocusVolumeFactor.takeIf { it.isFinite() }?.coerceIn(MIN_AUDIO_FOCUS_VOLUME_FACTOR, 1f) ?: 1f
+        val safeSleepTimerVolumeFactor = sleepTimerVolumeFactor.value.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 1f
         return if (recapAudioMuted.value) 0f else
-            (safePlayerVolume * safeNormalizeFactor * safeAudioFocusVolumeFactor).coerceIn(0f, maxSafeGainFactor)
+            (safePlayerVolume * safeNormalizeFactor * safeAudioFocusVolumeFactor * safeSleepTimerVolumeFactor)
+                .coerceIn(0f, maxSafeGainFactor)
+    }
+
+    fun setSleepTimerVolumeFactor(factor: Float) {
+        val safeFactor = factor.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 1f
+        if (sleepTimerVolumeFactor.value == safeFactor) return
+        sleepTimerVolumeFactor.value = safeFactor
+        if (::player.isInitialized) applyEffectiveVolumeImmediately()
     }
 
     fun setRecapMuted(muted: Boolean) {
@@ -2643,7 +2649,7 @@ class MusicService :
     }
 
     private fun shouldRampEffectiveVolume(finalVolume: Float): Boolean {
-        if (crossfadeCoordinator?.controlsSessionVolume == true) return false
+        if (crossfadeHandler?.isFading == true) return false
         if (!shouldKeepPlaybackAudible()) return false
         if (!finalVolume.isFinite()) return false
         if (player.volume <= STUCK_MUTED_VOLUME_EPSILON) return false
@@ -2658,17 +2664,13 @@ class MusicService :
 
     private fun applyEffectiveVolume(finalVolume: Float = currentEffectivePlayerVolume()) {
         if (!::player.isInitialized) return
-        val coordinator = crossfadeCoordinator
-        if (coordinator?.controlsSessionVolume == true) {
-            coordinator.wake()
-            return
-        }
+        if (crossfadeHandler?.isFading == true) return
         player.volume = finalVolume
     }
 
     private fun ensureAudiblePlaybackVolume(reason: String) {
         if (!::player.isInitialized) return
-        if (crossfadeCoordinator?.controlsSessionVolume == true) return
+        if (crossfadeHandler?.isFading == true) return
         if (!shouldKeepPlaybackAudible()) return
         if (playerVolume.value <= 0f) return
 
@@ -2704,32 +2706,28 @@ class MusicService :
     }
 
     fun pauseFromSleepTimer() {
-        sleepTimer.clear()
-        cancelCrossfade(resetVolume = true)
+        cancelCrossfade(resetVolume = false)
         player.pause()
         player.playWhenReady = false
         localPlayer.pause()
         localPlayer.playWhenReady = false
+        sleepTimer.clear()
+        applyEffectiveVolumeImmediately()
     }
 
     private fun scheduleCrossfade() {
         if (!::player.isInitialized) return
-        val coordinator = crossfadeCoordinator ?: return
-        if (coordinator.hasSwitchedSession) return
-        val request = resolveCrossfadeRequest()?.takeIf { player.playWhenReady || coordinator.isTransitioning }
-        if (request != null) {
-            coordinator.schedule(request)
-            return
-        }
-        val controlledVolume = coordinator.isTransitioning
-        coordinator.cancel()
-        if (controlledVolume) applyEffectiveVolumeImmediately()
+        crossfadeHandler?.schedule(resolveCrossfadePlan())
     }
 
-    private fun resolveCrossfadeRequest(): CrossfadeRequest? {
+    private fun isLocalPlaybackActive(): Boolean =
+        ::player.isInitialized && player.deviceInfo.playbackType == androidx.media3.common.DeviceInfo.PLAYBACK_TYPE_LOCAL
+
+    private fun resolveCrossfadePlan(): CrossfadePlan? {
         if (!crossfadeEnabled || crossfadeDurationMs <= 0L) return null
         if (sleepTimer.pauseWhenSongEnd) return null
-        if (player.deviceInfo.playbackType != androidx.media3.common.DeviceInfo.PLAYBACK_TYPE_LOCAL) return null
+        if (bitPerfectOutput.status.value.active) return null
+        if (!isLocalPlaybackActive()) return null
         if (player.mediaItemCount == 0 || player.currentTimeline.isEmpty) return null
         if (player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED) return null
 
@@ -2747,14 +2745,15 @@ class MusicService :
         if (currentItem.metadata?.isPodcast == true || targetItem.metadata?.isPodcast == true) return null
         if (!repeatCurrent && crossfadeGapless && isGaplessAlbumTransition(currentItem, targetItem)) return null
 
-        val durationMs = player.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: return null
-        val timeline = crossfadeTimeline(durationMs, crossfadeDurationMs) ?: return null
-        return CrossfadeRequest(
-            plan = CrossfadePlan(currentItem.mediaId, targetItem.mediaId, timeline),
+        val durationMs = localPlayer.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: return null
+        val triggerPositionMs = CrossfadePlan.triggerPositionMs(durationMs, crossfadeDurationMs) ?: return null
+        return CrossfadePlan(
+            outgoingMediaId = currentItem.mediaId,
             outgoingIndex = currentIndex,
+            incomingMediaId = targetItem.mediaId,
             incomingIndex = targetIndex,
-            outgoingItem = currentItem,
-            outgoingDurationMs = durationMs,
+            triggerPositionMs = triggerPositionMs,
+            fadeDurationMs = crossfadeDurationMs,
         )
     }
 
@@ -2789,47 +2788,75 @@ class MusicService :
         return currentAlbum != null && currentAlbum == targetAlbum
     }
 
-    private fun createCrossfadeTailPlayer(): ExoPlayer =
+    private fun buildLocalExoPlayer(): ExoPlayer =
         ExoPlayer
             .Builder(this)
             .setMediaSourceFactory(createMediaSourceFactory())
             .setRenderersFactory(createRenderersFactory())
-            .setLoadControl(createCrossfadeLoadControl())
+            .setLoadControl(createPrimaryLoadControl())
             .setTrackSelector(DefaultTrackSelector(this, SafeTrackSelectionFactory()))
-            .setHandleAudioBecomingNoisy(false)
+            .setHandleAudioBecomingNoisy(true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
-            .setAudioAttributes(playbackAudioAttributes(), false)
+            .setAudioAttributes(
+                playbackAudioAttributes(),
+                false,
+            ).setSeekBackIncrementMs(5000)
+            .setSeekForwardIncrementMs(5000)
+            .setDeviceVolumeControlEnabled(true)
             .build()
             .apply {
                 setOffloadEnabled(false)
-                val sessionAudioSessionId = localPlayer.audioSessionId
-                if (sessionAudioSessionId != C.AUDIO_SESSION_ID_UNSET) {
-                    setAudioSessionId(sessionAudioSessionId)
-                }
-                skipSilenceEnabled = localPlayer.skipSilenceEnabled
             }
 
-    private fun onCrossfadeFinished(
-        outcome: CrossfadeOutcome,
-        plan: CrossfadePlan,
-    ) {
-        if (outcome is CrossfadeOutcome.Abandoned) {
-            Timber.tag(TAG).d(
-                "Crossfade abandoned: reason=%s sessionSwitched=%s",
-                outcome.reason,
-                outcome.sessionSwitched,
-            )
-            if (!outcome.sessionSwitched && outcome.reason in CROSSFADE_RETRY_POINTLESS_REASONS) {
-                crossfadeSuppressedMediaId = plan.outgoingMediaId
+    private fun createCrossfadePlayer(): ExoPlayer {
+        val source = localPlayer
+        return buildLocalExoPlayer().apply {
+            val sessionAudioSessionId = source.audioSessionId
+            if (sessionAudioSessionId != C.AUDIO_SESSION_ID_UNSET) {
+                setAudioSessionId(sessionAudioSessionId)
             }
+            syncCrossfadePlayerConfiguration(this, source)
         }
+    }
+
+    private fun syncCrossfadePlayerConfiguration(
+        target: ExoPlayer,
+        source: ExoPlayer,
+    ) {
+        target.skipSilenceEnabled = source.skipSilenceEnabled
+        target.trackSelectionParameters = source.trackSelectionParameters
+        target.setOffloadEnabled(false)
+        target.setHandleAudioBecomingNoisy(!bitPerfectOutput.ownsUsbDisconnectHandling)
+    }
+
+    private fun activateCrossfadePlayer(
+        target: ExoPlayer,
+        source: ExoPlayer,
+    ) {
+        syncCrossfadePlayerConfiguration(target, source)
+        target.addAnalyticsListener(PlaybackStatsListener(false, this))
+    }
+
+    private fun releaseCrossfadePlayer(retired: ExoPlayer) {
+        runCatching { retired.stop() }
+        runCatching { retired.release() }
+            .onFailure { Timber.tag(TAG).w(it, "Unable to release crossfade player") }
+    }
+
+    private fun onCrossfadeFinished() {
         applyEffectiveVolumeImmediately()
         updateAudiblePlaybackRecovery()
         scheduleCrossfade()
     }
 
+    private fun onCrossfadeAbandoned(plan: CrossfadePlan) {
+        Timber.tag(TAG).d("Crossfade abandoned for %s", plan.outgoingMediaId)
+        crossfadeSuppressedMediaId = plan.outgoingMediaId
+        applyEffectiveVolumeImmediately()
+    }
+
     private fun cancelCrossfade(resetVolume: Boolean) {
-        crossfadeCoordinator?.cancel()
+        crossfadeHandler?.cancel()
         if (resetVolume && ::player.isInitialized) {
             applyEffectiveVolumeImmediately()
         }
@@ -6742,11 +6769,7 @@ class MusicService :
         updateHistoryTrackingPlaybackState()
         if (playbackState == Player.STATE_ENDED || playbackState == Player.STATE_IDLE) {
             enqueueCurrentHistorySessionForFinalization()
-            if (playbackState == Player.STATE_IDLE || crossfadeCoordinator?.hasSwitchedSession != true) {
-                cancelCrossfade(resetVolume = true)
-            } else {
-                crossfadeCoordinator?.wake()
-            }
+            cancelCrossfade(resetVolume = true)
             if (playbackState == Player.STATE_ENDED &&
                 !suppressAutoPlayback &&
                 player.currentMetadata?.isPodcast != true &&
@@ -6776,18 +6799,11 @@ class MusicService :
         reason: Int,
     ) {
         super.onPlayWhenReadyChanged(playWhenReady, reason)
-        crossfadeCoordinator?.wake()
         scheduleCrossfade()
-    }
-
-    override fun onPlaybackParametersChanged(playbackParameters: androidx.media3.common.PlaybackParameters) {
-        super.onPlaybackParametersChanged(playbackParameters)
-        crossfadeCoordinator?.setTailPlaybackParameters(playbackParameters)
     }
 
     override fun onIsPlayingChanged(isPlaying: Boolean) {
         super.onIsPlayingChanged(isPlaying)
-        crossfadeCoordinator?.wake()
         if (isPlaying) {
             scheduleCrossfade()
         }
@@ -7113,8 +7129,8 @@ class MusicService :
         super.onPositionDiscontinuity(oldPosition, newPosition, reason)
         val isSeekDiscontinuity =
             reason == Player.DISCONTINUITY_REASON_SEEK || reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT
-        if (isSeekDiscontinuity && crossfadeCoordinator?.hasSwitchedSession != true) {
-            cancelCrossfade(resetVolume = true)
+        if (isSeekDiscontinuity) {
+            crossfadeHandler?.finishFade()
         }
         scheduleCrossfade()
     }
@@ -7842,17 +7858,6 @@ class MusicService :
             ).setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
-    private fun createCrossfadeLoadControl(): DefaultLoadControl =
-        DefaultLoadControl
-            .Builder()
-            .setBufferDurationsMs(
-                CROSSFADE_MIN_BUFFER_MS,
-                CROSSFADE_MAX_BUFFER_MS,
-                CROSSFADE_MIN_BUFFER_BEFORE_START_MS.toInt(),
-                CROSSFADE_MIN_BUFFER_BEFORE_START_MS.toInt(),
-            ).setPrioritizeTimeOverSizeThresholds(true)
-            .build()
-
     private fun createRenderersFactory() =
         object : DefaultRenderersFactory(this) {
             override fun buildAudioSink(
@@ -8343,7 +8348,7 @@ class MusicService :
         } catch (_: Exception) {
         }
         try {
-            localPlayer.removeListener(audioEffectPlayerListener)
+            localPlaybackPlayer.removeListener(audioEffectPlayerListener)
             player.removeListener(this)
             player.removeListener(sleepTimer)
             player.release()
@@ -8619,19 +8624,10 @@ class MusicService :
         const val EFFECTIVE_VOLUME_RAMP_UP_MS = 350L
         const val EFFECTIVE_VOLUME_RAMP_DOWN_MS = 180L
         const val EFFECTIVE_VOLUME_RAMP_MIN_DELTA = 0.015f
-        const val CROSSFADE_MIN_BUFFER_BEFORE_START_MS = 5_000L
-        private val CROSSFADE_RETRY_POINTLESS_REASONS =
-            setOf(
-                CrossfadeAbandonReason.TailFailed,
-                CrossfadeAbandonReason.SyncDeadline,
-                CrossfadeAbandonReason.NextItemMissing,
-            )
         const val PRIMARY_MIN_BUFFER_MS = 20_000
         const val PRIMARY_MAX_BUFFER_MS = 60_000
         const val PRIMARY_BUFFER_FOR_PLAYBACK_MS = 750
         const val PRIMARY_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 2_500
-        const val CROSSFADE_MIN_BUFFER_MS = 15_000
-        const val CROSSFADE_MAX_BUFFER_MS = 45_000
         const val MIN_AUDIBLE_EFFECTIVE_VOLUME = 0.01f
         const val STUCK_MUTED_VOLUME_EPSILON = 0.001f
         const val AUDIBLE_PLAYBACK_VOLUME_CHECK_MS = 2_000L
